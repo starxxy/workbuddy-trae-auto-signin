@@ -1,0 +1,17 @@
+# 运行期产物（本机数据，不入库）
+config.json
+signin.log
+__pycache__/
+*.pyc
+
+# 发布产物（zip 为二进制构建件，按需自行打包）
+dist/
+
+# 本机保留、不入库的辅助模板
+*.plist.example
+
+# 系统与编辑器
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/
