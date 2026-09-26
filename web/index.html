@@ -617,6 +617,7 @@ input[type="checkbox"]:checked::after{
         <button class="btn btn--primary" type="button" data-sign="codebuddy">签 CodeBuddy</button>
         <button class="btn btn--primary" type="button" data-sign="trae">签 Trae CN</button>
         <button class="btn btn--primary" type="button" data-sign="traecode">签 Trae Code</button>
+        <button class="btn btn--primary" type="button" data-sign="qoder">签 Qoder</button>
         <button class="btn btn--solid" type="button" data-sign="both">全部一起签</button>
         <button class="btn btn--ghost" type="button" id="btnGrowth">只跑成长中心</button>
       </div>
@@ -638,6 +639,7 @@ input[type="checkbox"]:checked::after{
           <option value="all">全部</option>
           <option value="workbuddy">WorkBuddy</option>
           <option value="trae">Trae CN</option>
+          <option value="qoder">Qoder</option>
         </select>
       </label>
       <label class="field"><span>结果</span>
@@ -682,23 +684,26 @@ input[type="checkbox"]:checked::after{
      词表：必须与 webapp.py 的 RESULT_LABELS 保持一致
      ========================================================== */
   var LABELS = {
-    CLAIMED: "领取成功", CLAIM: "领取成功", ALREADY: "今日已签",
+    CLAIMED: "领取成功", CLAIM: "领取成功", PARTIAL: "部分领取成功",
+    ALREADY: "今日已签",
     INACTIVE: "活动未开放", NO_AUTH: "缺少登录凭据", NO_SESSION: "登录态失效",
     NETWORK: "网络不可达", TIMEOUT: "时间预算耗尽", ERROR: "执行失败",
     UNKNOWN: "未识别的返回", INFO: "信息", BUSY: "正在执行",
     FORBIDDEN: "请求被拒绝"
   };
   var TONES = {
-    CLAIMED: "jade", CLAIM: "jade", ALREADY: "sky", INACTIVE: "amber",
+    CLAIMED: "jade", CLAIM: "jade", PARTIAL: "brass",
+    ALREADY: "sky", INACTIVE: "amber",
     NO_AUTH: "amber", NO_SESSION: "amber", NETWORK: "rust", TIMEOUT: "rust",
     ERROR: "rust", UNKNOWN: "muted", INFO: "muted", BUSY: "brass"
   };
 
   var PLATFORM_NAME = { workbuddy: "WorkBuddy", codebuddy: "CodeBuddy",
-                        trae: "Trae CN", traecode: "Trae Code" };
+                        trae: "Trae CN", traecode: "Trae Code", qoder: "Qoder" };
   var PLATFORM_SUB = { workbuddy: "tencent copilot", codebuddy: "copilot.tencent.com（同体系）",
-                       trae: "trae.cn / checkin_credits", traecode: "api.trae.cn（同体系）" };
-  var PLATFORM_IDS = ["workbuddy", "codebuddy", "trae", "traecode"];
+                       trae: "trae.cn / checkin_credits", traecode: "api.trae.cn（同体系）",
+                       qoder: "qoder.sh / campaigns" };
+  var PLATFORM_IDS = ["workbuddy", "codebuddy", "trae", "traecode", "qoder"];
 
   var $ = function (id) { return document.getElementById(id); };
 
@@ -778,6 +783,11 @@ input[type="checkbox"]:checked::after{
       var t = card.reason === "NETWORK" || card.reason === "TIMEOUT" ? "rust" : "amber";
       return '<span class="chip chip--' + t + '">' + esc(label(card.reason)) + "</span>";
     }
+    if (card.engine === "qoder") {
+      return card.checked_in
+        ? '<span class="chip chip--jade">暂无可领</span>'
+        : '<span class="chip chip--amber">' + (isNum(card.claimable_count) ? card.claimable_count : "多") + ' 项可领</span>';
+    }
     return card.checked_in
       ? '<span class="chip chip--jade">今日已签</span>'
       : '<span class="chip chip--amber">待签到</span>';
@@ -792,6 +802,7 @@ input[type="checkbox"]:checked::after{
 
   function renderCard(card, index, total) {
     var p = card.platform;
+    var isQoder = card.engine === "qoder";
     var down = !card.ok;
     var cls = "card";
     if (index === 1 && total === 2) cls += " card--offset";
@@ -799,10 +810,12 @@ input[type="checkbox"]:checked::after{
     if (card.ok && !card.checked_in) cls += " card--pending";
 
     var creditsHtml = '<span class="card__credits num">' + esc(showNum(card.credits)) + "</span>" +
-                      '<span class="card__credits-label">累计积分</span>';
+                      '<span class="card__credits-label">' + (isQoder ? "可领积分" : "累计积分") + "</span>";
 
     var hint = card.report || (card.ok
-      ? (card.checked_in ? "今天已经签过了，无需再操作。" : "还没签到，可以直接点下面的按钮。")
+      ? (card.checked_in
+          ? (isQoder ? "活动福利都已领完，今天没有要处理的。" : "今天已经签过了，无需再操作。")
+          : (isQoder ? "有可领的活动福利，点下面的按钮领取。" : "还没签到，可以直接点下面的按钮。"))
       : "暂时拿不到状态。");
     if (card.installed === false) {
       hint = "未检测到 " + (PLATFORM_NAME[p] || p) + " 客户端，请先在电脑上安装并登录后再签到。";
@@ -818,8 +831,8 @@ input[type="checkbox"]:checked::after{
     if (card.ok) {
       rows += row("今日状态",
         card.checked_in
-          ? '<span class="chip chip--jade chip--plain">已签到</span>'
-          : '<span class="chip chip--amber chip--plain">未签到</span>');
+          ? '<span class="chip chip--jade chip--plain">' + (isQoder ? "已处理" : "已签到") + "</span>"
+          : '<span class="chip chip--amber chip--plain">' + (isQoder ? "有可领" : "未签到") + "</span>");
     }
 
     if (card.engine === "wb") {
@@ -836,6 +849,14 @@ input[type="checkbox"]:checked::after{
           card.active === false
             ? '<span class="chip chip--amber chip--plain">未开启</span>'
             : '<span class="chip chip--jade chip--plain">' + esc(card.activity_name || "已开启") + "</span>");
+      }
+    } else if (isQoder) {
+      if (card.ok) {
+        rows += row("运营活动", isNum(card.campaigns) ? esc(card.campaigns + " 个") : "–");
+        rows += row("可领福利",
+          card.claimable_count > 0
+            ? '<span class="chip chip--amber chip--plain">' + esc(card.claimable_count + " 项") + "</span>"
+            : '<span class="chip chip--jade chip--plain">暂无</span>');
       }
     } else {
       if (card.ok) {
@@ -857,7 +878,9 @@ input[type="checkbox"]:checked::after{
     if (card.endpoint) rows += rowText("接口地址", card.endpoint);
 
     var note = card.ok
-      ? (card.checked_in ? "今日已签到" : "点右侧按钮立即签到")
+      ? (card.checked_in
+          ? (isQoder ? "活动福利均已领取" : "今日已签到")
+          : (isQoder ? "点右侧按钮立即领取" : "点右侧按钮立即签到"))
       : "点右侧按钮尝试；失败原因见上方说明";
 
     return '<article class="' + cls + '">' +
@@ -872,7 +895,7 @@ input[type="checkbox"]:checked::after{
       '<div class="card__foot">' +
         '<button class="btn ' + (card.checked_in ? "btn--ghost" : "btn--primary") +
           ' btn--sm" type="button" data-sign="' + esc(p) + '">' +
-          (card.checked_in ? "再查一次" : "立即签到") + "</button>" +
+          (card.checked_in ? "再查一次" : (isQoder ? "立即领取" : "立即签到")) + "</button>" +
         '<span class="card__note">' + esc(note) + "</span>" +
       "</div>" +
     "</article>";

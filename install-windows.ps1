@@ -1,4 +1,4 @@
-# install-windows.ps1 — WorkBuddy + Trae CN 自动签到一键安装（Windows）
+# install-windows.ps1 — WorkBuddy + Trae CN + Qoder 自动签到一键安装（Windows）
 #
 # 协议：MIT
 #
@@ -8,10 +8,11 @@
 # 用法：在本仓库目录下，用 PowerShell 运行
 #     powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
 #     powershell -ExecutionPolicy Bypass -File .\install-windows.ps1 -Platform trae
+#     powershell -ExecutionPolicy Bypass -File .\install-windows.ps1 -Platform qoder
 #     powershell -ExecutionPolicy Bypass -File .\install-windows.ps1 -Platform both
 #
 # 参数：
-#   -Platform   workbuddy | trae | both        默认 workbuddy
+#   -Platform   workbuddy | trae | qoder | both        默认 workbuddy
 #   -Time       覆盖签到时间点，默认 00:05     例如 -Time 08:30
 #
 # 会创建的任务（默认 -Platform workbuddy）：
@@ -19,14 +20,14 @@
 #
 # -Platform both 时会额外创建：
 #   3) TraeAutoSignin        每天 00:05    Trae CN 签到（查状态→未签才领）
+#   4) QoderAutoSignin       每天 00:05    Qoder 活动领取（查活动→可领才领）
 #
-# -Platform trae 时只创建：
-#   3) TraeAutoSignin
+# -Platform trae / qoder 时只创建对应平台的任务。
 #
-# 两者都零 Token、无窗口、开机错过会自动补跑。
+# 都零 Token、无窗口、开机错过会自动补跑。
 
 param(
-    [ValidateSet("workbuddy", "trae", "both")]
+    [ValidateSet("workbuddy", "trae", "qoder", "both")]
     [string]$Platform = "workbuddy",
 
     [string]$Time = "00:05"
@@ -77,7 +78,7 @@ function Find-Pythonw {
 }
 
 Write-Host ""
-Write-Host "WorkBuddy + Trae CN 自动签到 · 一键安装" -ForegroundColor Cyan
+Write-Host "WorkBuddy + Trae CN + Qoder 自动签到 · 一键安装" -ForegroundColor Cyan
 Write-Host ("-" * 52) -ForegroundColor DarkGray
 Write-Host ("平台：{0}    签到时间：{1}" -f $Platform, $Time)
 Write-Host ""
@@ -149,6 +150,20 @@ try {
             -Action $act3 -Trigger $tri3 -Settings $set3 -Principal $principal `
             -Description "Trae CN daily auto signin (silent, zero token)" -Force | Out-Null
     }
+
+    # ----- Qoder 侧 -----
+    # Qoder 没有每日签到接口，等价动作是扫运营活动里可领的积分福利并逐个领取；
+    # 无活动/均已领取都算成功，逻辑与 Trae 一样只做一个每日任务、不做轮询。
+    if ($Platform -in @("qoder", "both")) {
+        $act4 = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$signin`" qoder silent"
+        $tri4 = New-ScheduledTaskTrigger -Daily -At $Time
+        $set4 = New-ScheduledTaskSettingsSet -StartWhenAvailable -Hidden `
+                -DontStopIfGoingOnBatteries -AllowStartIfOnBatteries `
+                -ExecutionTimeLimit (New-TimeSpan -Minutes 3)
+        Register-ScheduledTask -TaskName "QoderAutoSignin" `
+            -Action $act4 -Trigger $tri4 -Settings $set4 -Principal $principal `
+            -Description "Qoder daily campaign claim (silent, zero token)" -Force | Out-Null
+    }
 } catch {
     Write-Host " 失败" -ForegroundColor Red
     Write-Host ""
@@ -166,6 +181,9 @@ if ($Platform -in @("workbuddy", "both")) {
 }
 if ($Platform -in @("trae", "both")) {
     $report += @{ Name = "TraeAutoSignin";       When = $Time; What = "Trae CN 签到" }
+}
+if ($Platform -in @("qoder", "both")) {
+    $report += @{ Name = "QoderAutoSignin";      When = $Time; What = "Qoder 活动领取" }
 }
 foreach ($row in $report) {
     $t = Get-ScheduledTask -TaskName $row.Name
@@ -186,13 +204,14 @@ foreach ($row in $report) {
 }
 if ($Platform -eq "both") {
     Write-Host "或者一次性卸掉所有本脚本创建的任务：" -ForegroundColor DarkGray
-    Write-Host '  Get-ScheduledTask | Where-Object { $_.TaskName -match "^(WorkBuddy|Trae)" } | Unregister-ScheduledTask -Confirm:$false' -ForegroundColor DarkGray
+    Write-Host '  Get-ScheduledTask | Where-Object { $_.TaskName -match "^(WorkBuddy|Trae|Qoder)" } | Unregister-ScheduledTask -Confirm:$false' -ForegroundColor DarkGray
 }
 Write-Host ""
 Write-Host "手动快速验证：" -ForegroundColor DarkGray
 Write-Host "  python `"$signin`" trae status    # 只查 Trae CN 签到状态" -ForegroundColor DarkGray
+Write-Host "  python `"$signin`" qoder status   # 只查 Qoder 活动与可领福利" -ForegroundColor DarkGray
 Write-Host "  python `"$signin`" status         # 只查 WorkBuddy 签到状态" -ForegroundColor DarkGray
 if ($Platform -eq "both") {
-    Write-Host "  python `"$signin`" both silent    # 一次签两个平台" -ForegroundColor DarkGray
+    Write-Host "  python `"$signin`" both silent    # 一次签三个平台" -ForegroundColor DarkGray
 }
 Write-Host ""

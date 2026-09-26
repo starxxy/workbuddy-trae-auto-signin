@@ -1,8 +1,9 @@
-"""WorkBuddy + Trae CN 每日签到自动领取脚本（单文件）。
+"""WorkBuddy + Trae CN + Qoder 每日签到自动领取脚本（单文件）。
 
 能力：
   - WorkBuddy / CodeBuddy 每日签到 + 成长中心
   - Trae CN 每日签到（支持 Trae Solo CN / Trae CN / Trae 三条产品线）
+  - Qoder 活动福利领取（Qoder 无每日签到，等价动作=领取全部可领积分活动）
   - 纯 Python 标准库实现，零第三方依赖
   - 内置 AES-128-CBC 实现（优先用系统 openssl，缺失或失败时回落到内嵌纯 Python 版）
 
@@ -49,6 +50,29 @@ Trae CN 接口契约：
                "extra_credits": int, "code": 0}
     - claim : {"code": 0, "message": "success"}（成功时通常不回报积分）
 
+Qoder 接口契约：
+  GET  https://openapi.qoder.sh/sash/api/v1/me/campaigns        查询运营活动
+  POST https://openapi.qoder.sh/sash/api/v1/me/campaigns/{id}/claim  领取福利
+  POST https://openapi.qoder.sh/api/v1/deviceToken/refresh      刷新令牌（备用）
+
+  国际版（qoder.sh）与国内版（openapi.qoder.com.cn）是两套独立账号系统，
+  按序探测候选主机、先应答者留下；两套主机均 401/403 才判登录失效。
+  404 按官方前端行为视为"无活动"，不算错误。
+
+  认证方式：读本机 Qoder 桌面端数据目录（auth.v1.dat + Local State 同在）。
+    Local State 的 os_crypt.encrypted_key（base64，去 "DPAPI" 前缀）经
+    Windows DPAPI（CryptUnprotectData）解出 32 字节 AES key；
+    auth.v1.dat 布局 b"v10" + nonce(12) + ciphertext + GCM tag(16)，
+    用内嵌纯 Python AES-256-GCM 解密得 {token, refreshToken, expiresAt, user}。
+    因此 Qoder 段仅限 Windows 桌面端登录后的本机运行。
+
+  活动响应：{"showCampaign": bool, "claimable": bool,
+            "campaigns": [{campaignId, campaignKey, actionType,
+                           claimStatus: CLAIMABLE|CLAIMED,
+                           benefit: {kind: CREDITS, amount}}]}
+  仅 actionType=CLAIM_BENEFIT 且 claimStatus=CLAIMABLE 且 kind=CREDITS 的
+  活动会领取；无活动 INACTIVE、全部已领 ALREADY。
+
 用法：
   # WorkBuddy
   python signin.py auto           # 每日自动化：签到 + 成长中心
@@ -66,9 +90,15 @@ Trae CN 接口契约：
   python signin.py trae status    # Trae CN 查状态
   python signin.py trae claim     # Trae CN 强制签到
 
-  # 双平台一起跑
-  python signin.py both           # WB 完整 + Trae 完整
-  python signin.py both silent    # WB 静默签到 + Trae 静默签到
+  # Qoder
+  python signin.py qoder          # Qoder 领取全部可领活动
+  python signin.py qoder silent   # Qoder 静默模式
+  python signin.py qoder status   # Qoder 查活动/可领状态
+  python signin.py qoder claim    # Qoder 领取（同 qoder，服务端幂等）
+
+  # 全平台一起跑
+  python signin.py both           # WB 完整 + Trae 完整 + Qoder 完整
+  python signin.py both silent    # 三平台静默签到
 
 环境变量：
   WB_AUTH_FILE / WORKBUDDY_AUTH_FILE    — WorkBuddy auth.json 路径
@@ -77,6 +107,9 @@ Trae CN 接口契约：
   WB_GROWTH_LOG_EMPTY                   — 是否记录 no_op 成长中心日志
   TRAE_AUTH_FILE                        — Trae storage.json 路径（; 分隔多个）
   TRAE_STORAGE_DIR                      — Trae 存储根目录（覆盖自动探测）
+  QODER_AUTH_FILE                       — Qoder auth.v1.dat 完整路径（覆盖自动探测）
+  QODER_STORAGE_DIR                     — Qoder 数据目录（须同时含 auth.v1.dat 与 Local State）
+  QODER_API_BASE                        — Qoder API 主机覆盖（如 https://openapi.qoder.sh）
   OPENSSL_BIN                           — openssl 可执行文件完整路径（可选；
                                           未设置或无效时自动走内嵌纯 Python AES）
 
@@ -172,6 +205,35 @@ _TR_DRE = bytes([31,221,168,51,136,7,199,49,177,18,16,89,39,128,236,95,
                  96,81,127,169,25,181,74,13,45,229,122,159,147,201,156,239,
                  160,224,59,77,174,42,245,176,200,235,187,60,131,83,153,97,
                  23,43,4,126,186,119,214,38,225,105,20,99,85,33,12,125])
+
+
+# ============================================================
+# Qoder 相关常量（桌面端无"每日签到"，等价动作是"活动积分领取"）
+# ============================================================
+# 数据目录候选：Qoder 是 Electron/Chromium 系，Windows 目录名是 bundle id 形态
+# （实测 com.qoder.app.stable），macOS 在 ~/Library/Application Support 下同名。
+QODER_DATA_DIRS = ("com.qoder.app.stable", "Qoder", "qoder")
+QODER_AUTH_BASENAME = "auth.v1.dat"
+QODER_LOCAL_STATE_BASENAME = "Local State"
+
+# 凭据布局：auth.v1.dat = b"v10" + nonce(12) + 密文 + GCM tag(16)，AAD 为空；
+# AES-256 密钥在 "Local State" 的 os_crypt.encrypted_key（base64 去 5 字节
+# "DPAPI" 前缀后走当前用户作用域的 DPAPI 解封），解密复用文件里已有的
+# 纯 Python _aes256_gcm_decrypt，零第三方依赖。
+
+# 国际版与 CN 版是两套账号系统：同一 token 在 openapi.qoder.sh 返回 200、
+# 在 openapi.qoder.com.cn 返回 401（本机实测）。按序探测、先通者定，
+# QODER_API_BASE 可强制覆盖。
+QODER_API_BASES = ("https://openapi.qoder.sh", "https://openapi.qoder.com.cn")
+QODER_CAMPAIGNS_PATH = "/sash/api/v1/me/campaigns"
+QODER_REFRESH_PATH = "/api/v1/deviceToken/refresh"
+
+# access token 提前 5 分钟视为过期，给在途请求留余量
+QODER_EXPIRY_MARGIN = 300.0
+
+# claim 遇「根本没拿到响应」（连不上/超时）时的重试次数，与 Trae 侧同理：
+# 业务错误码不重试，避免把账号打进风控。
+QODER_CLAIM_RETRIES = 3
 
 
 # ============================================================
@@ -1189,6 +1251,304 @@ def trae_claim(headers):
                 "message": msg, "credits": credits}
     return last or {"ok": False, "http": CODE_NO_NETWORK,
                     "message": "network unreachable"}
+
+
+# ============================================================
+# Qoder 活动积分领取：凭据解密 + campaigns/claim 接口
+# ============================================================
+def _q_dpapi_unprotect(data):
+    """Windows DPAPI（CryptUnprotectData）解封 os_crypt 密钥，返回 32 字节 AES key。
+
+    Qoder 与所有 Chromium 系桌面端一样，把 Local State 里的密钥又包了一层
+    "当前用户"作用域的 DPAPI——密文只在本机本用户可解，把 auth.v1.dat 拷到
+    别的机器上没有意义，所以这条路径是 Windows-only；其它平台如实抛错。
+    """
+    if sys.platform != "win32":
+        raise RuntimeError("解密 Qoder 凭据依赖 Windows DPAPI，当前平台不支持，"
+                           "请在 Windows 上运行 qoder 命令")
+    import ctypes
+    import ctypes.wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", ctypes.wintypes.DWORD),
+                    ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    # buf 显式持有缓冲区，由 blob_in 结构体间接保活（实机验证过的写法）
+    buf = ctypes.create_string_buffer(data, len(data))
+    blob_in = DATA_BLOB(len(data), buf)
+    blob_out = DATA_BLOB()
+    if not ctypes.windll.crypt32.CryptUnprotectData(
+            ctypes.byref(blob_in), None, None, None, None, 0,
+            ctypes.byref(blob_out)):
+        raise RuntimeError("CryptUnprotectData 失败（WinError %d），"
+                           "请在加密时所用的 Windows 账户下运行"
+                           % ctypes.windll.kernel32.GetLastError())
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+
+
+def find_qoder_dir():
+    """探测同时含 auth.v1.dat 与 Local State 的 Qoder 数据目录。
+
+    返回 (dir_or_None, looked_in)，形态与 find_trae_storage_file 对齐。
+    """
+    override = os.environ.get("QODER_AUTH_FILE")
+    if override:
+        ok = os.path.exists(override)
+        return (os.path.dirname(override) if ok else None), [override]
+
+    override_dir = os.environ.get("QODER_STORAGE_DIR")
+    if override_dir:
+        candidates = [override_dir]
+    else:
+        home = os.path.expanduser("~")
+        local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        appdata = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+        candidates = []
+        for d in QODER_DATA_DIRS:
+            candidates.append(os.path.join(appdata, d))
+            candidates.append(os.path.join(local, d))
+            candidates.append(os.path.join(home, "Library", "Application Support", d))
+            candidates.append(os.path.join(home, ".config", d))
+
+    for c in candidates:
+        if (os.path.exists(os.path.join(c, QODER_AUTH_BASENAME))
+                and os.path.exists(os.path.join(c, QODER_LOCAL_STATE_BASENAME))):
+            return c, candidates
+    return None, candidates
+
+
+def _q_parse_time(value):
+    """把 expiresAt / expires_at 统一解析成 epoch 秒。
+
+    auth.v1.dat 里是 ISO 字符串（如 "2026-10-19T09:18:32Z"，曾被当作 epoch 秒
+    比较踩过类型坑）；refresh 接口的 expires_at 则可能是秒/毫秒时间戳。三种
+    形态在这里一次收敛，认不出就返回 None（按"不过期"降级，不误杀会话）。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        v = float(value)
+        return v / 1000.0 if v > 1e11 else v
+    if isinstance(value, str) and value.strip():
+        try:
+            return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def load_qoder_session(qdir):
+    """解密 {qdir}\\auth.v1.dat，按官方 schema 校验，返回会话 dict。"""
+    try:
+        with open(os.path.join(qdir, QODER_LOCAL_STATE_BASENAME),
+                  "r", encoding="utf-8") as f:
+            local_state = json.load(f)
+    except Exception as e:
+        raise ValueError("读取 Local State 失败: %s" % e)
+
+    enc_b64 = (local_state.get("os_crypt") or {}).get("encrypted_key")
+    if not enc_b64:
+        raise ValueError("Local State 缺少 os_crypt.encrypted_key"
+                         "（目录不对，或客户端加密方案已变更）")
+    enc = base64.b64decode(enc_b64)
+    if enc[:5] != b"DPAPI":
+        raise ValueError("encrypted_key 前缀异常（期望 b'DPAPI'），格式可能已变")
+
+    key = _q_dpapi_unprotect(enc[5:])
+    if len(key) != 32:
+        raise ValueError("DPAPI 解出的密钥不是 32 字节（得到 %d）" % len(key))
+
+    try:
+        with open(os.path.join(qdir, QODER_AUTH_BASENAME), "rb") as f:
+            raw = f.read()
+    except Exception as e:
+        raise ValueError("读取 auth.v1.dat 失败: %s" % e)
+    if raw[:3] != b"v10" or len(raw) < 3 + 12 + 16:
+        raise ValueError("auth.v1.dat 头部异常（期望 b'v10'），凭据格式可能已变更")
+
+    nonce, blob = raw[3:15], raw[15:]
+    plaintext = _aes256_gcm_decrypt(key, nonce, b"", blob[:-16], blob[-16:])
+    try:
+        auth = json.loads(plaintext.decode("utf-8"))
+    except Exception as e:
+        raise ValueError("auth.v1.dat 解密后不是合法 JSON（GCM 认证虽过，内容异常）: %s" % e)
+
+    # 官方校验条件（asar 原文等价）：schemaVersion==1，四个字符串字段与
+    # user.id 齐备，缺一即视为未登录。
+    if (not isinstance(auth, dict) or auth.get("schemaVersion") != 1
+            or not isinstance(auth.get("token"), str)
+            or not isinstance(auth.get("refreshToken"), str)
+            or not isinstance(auth.get("expiresAt"), str)
+            or not isinstance(auth.get("user"), dict)
+            or not isinstance(auth["user"].get("id"), str)):
+        raise ValueError("凭据字段不完整，请在 Qoder 桌面端重新登录")
+
+    return {
+        "token": auth["token"],
+        "refreshToken": auth["refreshToken"],
+        "expires_at": _q_parse_time(auth.get("expiresAt")),
+        "refresh_expires_at": _q_parse_time(auth.get("refreshTokenExpiresAt")),
+        "email": auth["user"].get("email"),
+    }
+
+
+_q_base_cache = None   # 本次运行内记住先应答的主机，claim/refresh 不再重复试错
+
+
+def _q_bases():
+    """候选主机列表：环境变量覆盖 > 上次成功的缓存 > 内置顺序。"""
+    override = os.environ.get("QODER_API_BASE")
+    if override and override.strip():
+        return [override.strip().rstrip("/")]
+    bases = list(QODER_API_BASES)
+    if _q_base_cache in bases:
+        bases.remove(_q_base_cache)
+        bases.insert(0, _q_base_cache)
+    return bases
+
+
+def build_qoder_headers(token):
+    """组装 Qoder 请求头。
+
+    官方客户端还带一串 Cosy-Version / Cosy-MachineOS / Cosy-MachineHostname 等
+    设备头，但各头的取值格式没有实机依据；猜错格式反而是明显的机器指纹。
+    官方 AB() 规则本就是"取到才带"，这里只带实机验证过被服务端接受的最小集。
+    """
+    return {
+        "Accept": "application/json",
+        "User-Agent": "Qoder",
+        "Authorization": "Bearer %s" % token,
+        "Cosy-ClientType": "10",
+    }
+
+
+def _qoder_request(url, headers, method="POST", payload=None, timeout=30):
+    """Qoder 侧网络出口，语义与 _trae_request 完全一致（状态码, JSON体），直接复用。"""
+    return _trae_request(url, headers, method=method, payload=payload, timeout=timeout)
+
+
+def qoder_refresh(session):
+    """用 refreshToken 换新 access token（只更新内存会话），成功返回 True。
+
+    官方实现（asar）：POST {base}/api/v1/deviceToken/refresh，body
+    {"refresh_token": ...}，不需要任何 Authorization；400/401/403 为凭证作废，
+    其它非 2xx 为服务端抖动。本函数不回写 auth.v1.dat——回写需要自造 AES-GCM
+    加密器，且有弄坏客户端凭据文件的风险；access token 有效期约三周，绝大
+    多数运行走不到这条路径。若服务端轮换 refresh token 而我们不落盘，代价
+    是下次要重新登录桌面端，两害相权取其轻。
+    """
+    global _q_base_cache
+    if not session.get("refreshToken"):
+        return False
+    headers = {"Accept": "application/json",
+               "Content-Type": "application/json",
+               "User-Agent": "Qoder"}
+    for base in _q_bases():
+        code, body = _qoder_request(base + QODER_REFRESH_PATH, headers, "POST",
+                                    {"refresh_token": session["refreshToken"]})
+        if code == 200 and isinstance(body, dict):
+            tok = body.get("device_token") or body.get("token")
+            if tok:
+                session["token"] = tok
+                session["refreshToken"] = body.get("refresh_token") or session["refreshToken"]
+                session["expires_at"] = _q_parse_time(body.get("expires_at")) or session.get("expires_at")
+                _q_base_cache = base
+                return True
+    return False
+
+
+def qoder_campaigns(session):
+    """拉取活动列表。
+
+    返回 {"ok": True, "campaigns": [...], ...}；不 ok 时 reason ∈
+    {network, auth, other}。404 按官方行为视为"无活动"而不是错误；401/403
+    可能是"账号体系不匹配走错主机"（实测国际 token 打 CN 主机即 401），
+    所以要换完全部主机才下 auth 结论，不能见 401 就判死刑。
+    """
+    global _q_base_cache
+    headers = build_qoder_headers(session["token"])
+    auth_fail = None
+    other = None
+    for base in _q_bases():
+        code, body = _qoder_request(base + QODER_CAMPAIGNS_PATH, headers, "GET")
+        if code == 200 and isinstance(body, dict):
+            _q_base_cache = base
+            camps = body.get("campaigns")
+            return {"ok": True, "http": 200,
+                    "show_campaign": bool(body.get("showCampaign")),
+                    "claimable": bool(body.get("claimable")),
+                    "campaigns": camps if isinstance(camps, list) else []}
+        if code == 404:
+            _q_base_cache = base
+            return {"ok": True, "http": 404, "show_campaign": False,
+                    "claimable": False, "campaigns": []}
+        if code in (401, 403):
+            auth_fail = {"ok": False, "reason": "auth", "http": code, "body": body}
+            continue
+        if code != CODE_NO_NETWORK:
+            # 主机活着但答复异常（5xx/体形不对）：换主机大概率同样，早停
+            other = {"ok": False, "reason": "other", "http": code, "body": body}
+            break
+    if auth_fail:
+        return auth_fail
+    if other:
+        return other
+    return {"ok": False, "reason": "network", "http": CODE_NO_NETWORK,
+            "body": "network unreachable"}
+
+
+def _q_benefit_of(campaign):
+    b = campaign.get("benefit")
+    return b if isinstance(b, dict) else {}
+
+
+def qoder_pick_claimable(campaigns):
+    """挑出"可领积分"的活动。
+
+    官方 iframe 前端的判定等价：actionType=CLAIM_BENEFIT、
+    claimStatus=CLAIMABLE、benefit.kind=CREDITS 且 amount 为有限数。
+    VIEW_DETAILS / CLAIMED / 非积分福利都不在此列。
+    """
+    picked = []
+    for c in campaigns or []:
+        if not isinstance(c, dict):
+            continue
+        b = _q_benefit_of(c)
+        amount = b.get("amount")
+        if (c.get("actionType") == "CLAIM_BENEFIT"
+                and c.get("claimStatus") == "CLAIMABLE"
+                and b.get("kind") == "CREDITS"
+                and isinstance(amount, (int, float)) and not isinstance(amount, bool)
+                and math.isfinite(amount)):
+            picked.append(c)
+    return picked
+
+
+def qoder_claim(session, campaign_id, credits=0):
+    """领取单个活动积分：POST {base}/sash/api/v1/me/campaigns/{id}/claim。
+
+    campaignId 需 URL 编码（官方 fetch 即 encodeURIComponent + keepalive）。
+    与 trae_claim 同一原则：只对"根本没拿到响应"的网络错误重试，业务错误码
+    当场定论；错误响应体形如 {"errorCode", "requestId"}，原样带回便于排查。
+    """
+    last = None
+    for attempt in range(QODER_CLAIM_RETRIES):
+        base = _q_base_cache or _q_bases()[0]
+        url = base + QODER_CAMPAIGNS_PATH + "/" + urllib.parse.quote(
+            str(campaign_id), safe="") + "/claim"
+        code, body = _qoder_request(url, build_qoder_headers(session["token"]),
+                                    "POST")
+        if code == CODE_NO_NETWORK and attempt + 1 < QODER_CLAIM_RETRIES:
+            last = {"ok": False, "http": code, "body": body}
+            time.sleep(2.0 + attempt * 2.0)
+            continue
+        if 200 <= code < 300:
+            return {"ok": True, "http": code, "credits": credits, "body": body}
+        return {"ok": False, "http": code, "body": body}
+    return last or {"ok": False, "http": CODE_NO_NETWORK}
 
 
 # ============================================================
@@ -2463,16 +2823,131 @@ def _run_trae(sub_action):
     return 1
 
 
-def _run_both(silent=False):
-    """双平台签到：先跑 WorkBuddy，再跑 Trae CN；任一失败不影响另一个。
+def _run_qoder(sub_action):
+    """Qoder 签到编排：找数据目录 → 解密凭据 → 查活动 → 领取全部可领积分项。
 
-    silent=True 时两个子命令都用 silent 前缀（结果落盘、空跑不刷屏）。
-    返回码取两者较大值，任一失败即非零。
+    Qoder 没有"每日签到"接口，等价动作是扫 campaigns 里所有 CLAIMABLE 的积分
+    福利并逐个 claim；无活动记 INACTIVE、全部已领记 ALREADY。
+
+    sub_action 取值：
+      auto    → 领取全部可领项（没有可领也算成功）
+      silent  → 同 auto，但走 silent 路径（结果落盘、空跑不刷屏）
+      status  → 只报活动与可领状态，不发领取请求
+      claim   → 同 auto（领取本就由服务端按 campaignId 幂等判定，无需强领分支）
+    """
+    _start_budget(sub_action or "qoder")
+    if sub_action in ("auto", "silent"):
+        _sleep_jitter()
+
+    qdir, looked_in = find_qoder_dir()
+    if not qdir:
+        emit({"result": "NO_AUTH", "platform": "qoder",
+              "report": "未找到 Qoder 桌面端数据目录（auth.v1.dat + Local State），"
+                        "请先在本机登录 Qoder 桌面端；"
+                        "或设置环境变量 QODER_AUTH_FILE 指向 auth.v1.dat",
+              "looked_in": looked_in}, sub_action)
+        return 2
+
+    try:
+        session = load_qoder_session(qdir)
+    except Exception as e:
+        emit({"result": "ERROR", "platform": "qoder",
+              "report": "加载 Qoder 会话失败（%s: %s）" % (type(e).__name__, e)}, sub_action)
+        return 2
+
+    # token 临近过期先尝试刷新；刷新失败也带着旧 token 上路，
+    # 让服务端用 401 说话，比我们本地猜时钟偏差可靠。
+    exp = session.get("expires_at")
+    if exp and exp - QODER_EXPIRY_MARGIN < time.time():
+        qoder_refresh(session)
+
+    res = qoder_campaigns(session)
+    if not res.get("ok"):
+        reason = res.get("reason")
+        if reason == "network":
+            emit({"result": "NETWORK", "platform": "qoder",
+                  "report": "网络不可达", "body": res.get("body")}, sub_action)
+        elif reason == "auth":
+            emit({"result": "NO_SESSION", "platform": "qoder",
+                  "report": "Qoder 登录态已失效（候选主机均返回 %s），"
+                            "请在 Qoder 桌面端重新登录" % res.get("http"),
+                  "http": res.get("http")}, sub_action)
+        else:
+            emit({"result": "ERROR", "platform": "qoder",
+                  "report": "活动查询失败", "http": res.get("http"),
+                  "body": res.get("body")}, sub_action)
+        return 1
+
+    campaigns = res.get("campaigns") or []
+    picked = qoder_pick_claimable(campaigns)
+
+    if sub_action == "status":
+        total = sum(int(_q_benefit_of(c).get("amount") or 0) for c in picked)
+        emit({"step": "qoder-status", "platform": "qoder",
+              "campaigns": len(campaigns), "claimable_count": len(picked),
+              "show_campaign": res.get("show_campaign"),
+              "claimable": res.get("claimable"), "credits": total}, sub_action)
+        return 0
+
+    if not campaigns:
+        emit({"result": "INACTIVE", "platform": "qoder",
+              "report": "Qoder 当前无运营活动"}, sub_action)
+        return 0
+
+    if not picked:
+        emit({"result": "ALREADY", "platform": "qoder",
+              "report": "Qoder 活动福利均已领取（共 %d 个活动）" % len(campaigns)},
+             sub_action)
+        return 0
+
+    got_total = 0
+    got_count = 0
+    fails = []
+    for c in picked:
+        amount = int(_q_benefit_of(c).get("amount") or 0)
+        cl = qoder_claim(session, c.get("campaignId"), amount)
+        if cl.get("ok"):
+            got_count += 1
+            got_total += amount
+        else:
+            fails.append({"campaignId": c.get("campaignId"),
+                          "campaignKey": c.get("campaignKey"),
+                          "http": cl.get("http"), "body": cl.get("body")})
+        if fails or not _budget_left():
+            # 一次领取失败大概率是登录态/活动状态问题，再连环 POST 只会制造废请求
+            break
+
+    if not fails:
+        emit({"result": "CLAIM", "platform": "qoder",
+              "report": "Qoder 领取成功（%d 项，积分 %d）" % (got_count, got_total),
+              "credits": got_total}, sub_action)
+        return 0
+    if got_count:
+        emit({"result": "PARTIAL", "platform": "qoder",
+              "report": "Qoder 部分领取成功（%d 项 / 积分 %d，%d 项失败）" % (
+                  got_count, got_total, len(fails)),
+              "credits": got_total, "failed": fails}, sub_action)
+        return 1
+    if any(f.get("http") == CODE_NO_NETWORK for f in fails):
+        emit({"result": "NETWORK", "platform": "qoder",
+              "report": "网络不可达（领取失败）", "failed": fails}, sub_action)
+        return 1
+    emit({"result": "ERROR", "platform": "qoder",
+          "report": "Qoder 领取失败", "failed": fails}, sub_action)
+    return 1
+
+
+def _run_both(silent=False):
+    """全平台签到：WorkBuddy → Trae CN → Qoder，任一失败不影响其它平台。
+
+    silent=True 时各子命令都用 silent 前缀（结果落盘、空跑不刷屏）。
+    返回码取各平台最大值，任一失败即非零。
     """
     wb_action = "silent" if silent else "auto"
     tr_action = "silent" if silent else "auto"
+    qd_action = "silent" if silent else "auto"
 
-    # WorkBuddy 侧：走 _run 正常路径，action 不匹配 trae/both 前缀
+    # WorkBuddy 侧：走 _run 正常路径，action 不匹配 trae/qoder/both 前缀
     try:
         wb_code = _run(wb_action)
     except Exception as e:
@@ -2488,19 +2963,25 @@ def _run_both(silent=False):
               "report": "Trae 侧异常（%s: %s）" % (type(e).__name__, e)}, tr_action)
         tr_code = 2
 
-    return max(wb_code, tr_code)
+    # Qoder 侧：同理，独立凭据、独立主机，与前两者成败互不相干
+    try:
+        qd_code = _run_qoder(qd_action)
+    except Exception as e:
+        emit({"result": "ERROR", "platform": "qoder",
+              "report": "Qoder 侧异常（%s: %s）" % (type(e).__name__, e)}, qd_action)
+        qd_code = 2
+
+    return max(wb_code, tr_code, qd_code)
 
 
 def main():
     """薄壳：只负责取命令 + 兜住一切异常，保证 silent 模式下结果必定落盘。"""
-    # 支持多参数命令（如 "trae silent"、"both silent"）
+    # 支持多参数命令（如 "trae silent"、"qoder silent"、"both silent"）
     if len(sys.argv) > 1:
         action = sys.argv[1]
-        # 特殊：把 "trae silent" / "both silent" 拼成一个整体命令名
-        if action == "trae" and len(sys.argv) > 2:
-            action = "trae " + sys.argv[2]
-        if action == "both" and len(sys.argv) > 2:
-            action = "both " + sys.argv[2]
+        # 特殊：把 "trae silent" / "qoder silent" / "both silent" 拼成一个整体命令名
+        if action in ("trae", "qoder", "both") and len(sys.argv) > 2:
+            action = action + " " + sys.argv[2]
     else:
         action = "auto"
     try:
@@ -2512,8 +2993,8 @@ def main():
 
 
 def _run(action):
-    # --- 新命令：Trae CN 与 双平台 both（不需要 WorkBuddy auth 文件） ---
-    # 这些命令只走 Trae 存储路径，因此不能落入下面的 WorkBuddy auth 探测逻辑。
+    # --- 新命令：Trae CN / Qoder 与 全平台 both（不需要 WorkBuddy auth 文件） ---
+    # 这些命令只走各自的存储路径，因此不能落入下面的 WorkBuddy auth 探测逻辑。
     if action == "trae":
         return _run_trae("auto")
     if action == "trae status":
@@ -2522,12 +3003,21 @@ def _run(action):
         return _run_trae("claim")
     if action == "trae silent":
         return _run_trae("silent")
+    if action == "qoder":
+        return _run_qoder("auto")
+    if action == "qoder status":
+        return _run_qoder("status")
+    if action == "qoder claim":
+        return _run_qoder("claim")
+    if action == "qoder silent":
+        return _run_qoder("silent")
     if action in ("both", "both silent"):
         return _run_both(silent=("silent" in action))
 
     _start_budget(action)
     known = ("auto", "silent", "growth", "silent-poll", "silent-growth", "status", "claim", "all",
              "trae", "trae silent", "trae status", "trae claim",
+             "qoder", "qoder silent", "qoder status", "qoder claim",
              "both", "both silent")
     if action not in known:
         emit({"result": "ERROR",

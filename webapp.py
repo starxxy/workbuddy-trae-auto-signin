@@ -83,6 +83,8 @@ TASKS = (
      "label": "WorkBuddy 每日签到", "note": "每天固定时间跑一次 auto"},
     {"name": "TraeAutoSignin", "platform": "trae", "kind": "signin",
      "label": "Trae CN 每日签到", "note": "每天固定时间跑一次 trae silent"},
+    {"name": "QoderAutoSignin", "platform": "qoder", "kind": "signin",
+     "label": "Qoder 活动领取", "note": "每天固定时间跑一次 qoder silent"},
 )
 TASK_NAMES = tuple(t["name"] for t in TASKS)
 
@@ -95,6 +97,7 @@ LINE_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s*(.*)$")
 RESULT_LABELS = {
     "CLAIMED": "领取成功",
     "CLAIM": "领取成功",
+    "PARTIAL": "部分领取成功",
     "ALREADY": "今日已签",
     "INACTIVE": "活动未开放",
     "NO_AUTH": "缺少登录凭据",
@@ -241,6 +244,39 @@ def _load_trae():
     return storage_path, session, headers
 
 
+def _load_qoder():
+    """返回 (数据目录, session)，失败抛 AuthMissing。
+
+    与 signin._run_qoder 同口径：token 临近过期先尝试刷新；刷新失败也带着旧
+    token 上路，让服务端的 401 说话，比我们本地猜时钟偏差可靠。刷新只更新内存
+    里的 session，不回写磁盘。
+    """
+    qdir, looked_in = signin.find_qoder_dir()
+    if not qdir:
+        raise AuthMissing(
+            "NO_AUTH",
+            "未找到 Qoder 桌面端数据目录（auth.v1.dat + Local State）。"
+            "请先登录 Qoder 桌面端；或设置环境变量 QODER_AUTH_FILE 指向该文件。",
+            looked_in=looked_in)
+
+    try:
+        session = signin.load_qoder_session(qdir)
+    except Exception as e:
+        raise AuthMissing(
+            "ERROR",
+            "加载 Qoder 会话失败（%s: %s）" % (type(e).__name__, e),
+            credential_file=qdir)
+
+    exp = session.get("expires_at")
+    if exp and exp - signin.QODER_EXPIRY_MARGIN < time.time():
+        try:
+            signin.qoder_refresh(session)
+        except Exception:
+            pass
+
+    return qdir, session
+
+
 def _begin_budget(action):
     """重置 signin 模块级的时间预算时钟。
 
@@ -277,6 +313,10 @@ PROVIDERS = (
          appdata_names=("TRAE Code", "Trae Code", "TraeCode", "TraeCodeExtension",
                         "TRAE SOLO CN", "TRAE CN", "Trae CN", "TRAE", "Trae"),
          exec_names=("Trae\\Trae.exe", "Trae Code\\TraeCode.exe")),
+    dict(id="qoder", name="Qoder", engine="qoder",
+         sub="qoder.sh / campaigns",
+         appdata_names=("com.qoder.app.stable", "Qoder", "qoder"),
+         exec_names=("Qoder\\Qoder.exe", "Qoder IDE\\Qoder IDE.exe")),
 )
 PROVIDER_MAP = {p["id"]: p for p in PROVIDERS}
 PLATFORM_IDS = tuple(p["id"] for p in PROVIDERS)
@@ -295,8 +335,10 @@ def provider_status(pid):
     installed, found, _looked = provider_readiness(prov)
     if prov["engine"] == "wb":
         card = wb_status(pid, prov["name"])
-    else:
+    elif prov["engine"] == "trae":
         card = trae_status(pid, prov["name"])
+    else:
+        card = qoder_status(pid, prov["name"])
     card["installed"] = installed
     card["engine"] = prov["engine"]
     card["sub"] = prov["sub"]
@@ -394,6 +436,61 @@ def trae_status(plat="trae", name="Trae CN"):
                 credits=st.get("credits"))
     if not card["enable"]:
         card["report"] = "签到活动暂未开放"
+    return card
+
+
+def qoder_status(plat="qoder", name="Qoder"):
+    """Qoder 引擎的平台卡片数据（活动福利型：无每日签到，报活动数与可领数）。"""
+    card = {"platform": plat, "name": name, "ok": False}
+    try:
+        qdir, session = _load_qoder()
+    except AuthMissing as e:
+        card.update(reason=e.code, report=e.report)
+        card.update(e.extra)
+        return card
+
+    card["credential_file"] = qdir
+    _begin_budget("web-status")
+    try:
+        res = signin.qoder_campaigns(session)
+    except Exception as e:
+        card.update(reason="ERROR",
+                    report="查询失败（%s: %s）" % (type(e).__name__, e))
+        return card
+
+    if not res.get("ok"):
+        reason = res.get("reason")
+        if reason == "network":
+            card.update(reason="NETWORK", report="网络不可达")
+        elif reason == "auth":
+            card.update(reason="NO_SESSION",
+                        report="Qoder 登录态已失效（候选主机均返回 %s），"
+                               "请在 Qoder 桌面端重新登录" % res.get("http"),
+                        http=res.get("http"))
+        else:
+            card.update(reason="ERROR",
+                        report="活动查询失败（HTTP %s）" % res.get("http"),
+                        http=res.get("http"))
+        return card
+
+    campaigns = res.get("campaigns") or []
+    picked = signin.qoder_pick_claimable(campaigns)
+    card.update(
+        ok=True,
+        # Qoder 没有"今日签到"概念：无可领项即等价于"已处理完毕"，
+        # 复用前端 checked_in 字段驱动"今日已签/待签到"的卡片形态
+        checked_in=(len(picked) == 0),
+        campaigns=len(campaigns),
+        claimable_count=len(picked),
+        credits=sum(int(signin._q_benefit_of(c).get("amount") or 0)
+                    for c in picked),
+        show_campaign=res.get("show_campaign"),
+        claimable=res.get("claimable"),
+    )
+    if not campaigns:
+        card["report"] = "当前无运营活动"
+    elif not picked:
+        card["report"] = "活动福利均已领取"
     return card
 
 
@@ -523,11 +620,98 @@ def sign_trae(plat="trae", name="Trae CN"):
     return out
 
 
+def sign_qoder(plat="qoder", name="Qoder"):
+    """Qoder 侧：查活动 → 领取全部可领积分项（镜像 _run_qoder 的 auto 分支）。
+
+    与 CLI 同语义：无活动=INACTIVE、全部已领=ALREADY、全成=CLAIM、
+    部分=PARTIAL；一次领取失败即停，防废请求连环。
+    """
+    out = {"platform": plat, "name": name, "ok": False}
+    try:
+        _qdir, session = _load_qoder()
+    except AuthMissing as e:
+        out.update(result=e.code, report=e.report)
+        out.update(e.extra)
+        _write_signin_log(out)
+        return out
+
+    _begin_budget("web-auto")
+    try:
+        res = signin.qoder_campaigns(session)
+    except Exception as e:
+        out.update(result="ERROR",
+                   report="查询失败（%s: %s）" % (type(e).__name__, e))
+        _write_signin_log(out)
+        return out
+
+    if not res.get("ok"):
+        reason = res.get("reason")
+        if reason == "network":
+            out.update(result="NETWORK", report="网络不可达，领取跳过")
+        elif reason == "auth":
+            out.update(result="NO_SESSION",
+                       report="Qoder 登录态已失效（候选主机均返回 %s），"
+                              "请在桌面端重新登录" % res.get("http"))
+        else:
+            out.update(result="ERROR",
+                       report="活动查询失败（HTTP %s）" % res.get("http"),
+                       http=res.get("http"))
+        _write_signin_log(out)
+        return out
+
+    campaigns = res.get("campaigns") or []
+    picked = signin.qoder_pick_claimable(campaigns)
+    if not campaigns:
+        out.update(ok=True, result="INACTIVE", report="Qoder 当前无运营活动")
+        _write_signin_log(out)
+        return out
+    if not picked:
+        out.update(ok=True, result="ALREADY",
+                   report="Qoder 活动福利均已领取（共 %d 个活动）" % len(campaigns))
+        _write_signin_log(out)
+        return out
+
+    got_total = 0
+    got_count = 0
+    fails = []
+    for c in picked:
+        amount = int(signin._q_benefit_of(c).get("amount") or 0)
+        try:
+            cl = signin.qoder_claim(session, c.get("campaignId"), amount)
+        except Exception as e:
+            fails.append({"campaignId": c.get("campaignId"),
+                          "error": "%s: %s" % (type(e).__name__, e)})
+            break
+        if cl.get("ok"):
+            got_count += 1
+            got_total += amount
+        else:
+            fails.append({"campaignId": c.get("campaignId"),
+                          "campaignKey": c.get("campaignKey"),
+                          "http": cl.get("http"), "body": cl.get("body")})
+        if fails or not signin._budget_left():
+            break
+
+    if not fails:
+        out.update(ok=True, result="CLAIM", credits=got_total,
+                   report="Qoder 领取成功（%d 项，积分 %d）" % (got_count, got_total))
+    elif got_count:
+        out.update(result="PARTIAL", credits=got_total,
+                   report="Qoder 部分领取成功（%d 项 / 积分 %d，%d 项失败）" % (
+                       got_count, got_total, len(fails)), failed=fails)
+    elif any(f.get("http") == signin.CODE_NO_NETWORK for f in fails):
+        out.update(result="NETWORK", report="网络不可达（领取失败）", failed=fails)
+    else:
+        out.update(result="ERROR", report="Qoder 领取失败", failed=fails)
+    _write_signin_log(out)
+    return out
+
+
 @app.post("/api/signin/<platform>")
 def api_signin(platform):
     if platform in ("both", "all"):
-        # 两个引擎各签一次即可，避免同体系平台重复领取（幂等也会兜底，但没必要）
-        targets = [("workbuddy", "wb"), ("trae", "trae")]
+        # 三个引擎各签一次即可，避免同体系平台重复领取（幂等也会兜底，但没必要）
+        targets = [("workbuddy", "wb"), ("trae", "trae"), ("qoder", "qoder")]
     elif platform in PROVIDER_MAP:
         targets = [(platform, PROVIDER_MAP[platform]["engine"])]
     else:
@@ -559,8 +743,10 @@ def api_signin(platform):
                 continue
             if engine == "wb":
                 results.append(sign_workbuddy(pid, prov["name"]))
-            else:
+            elif engine == "trae":
                 results.append(sign_trae(pid, prov["name"]))
+            else:
+                results.append(sign_qoder(pid, prov["name"]))
     finally:
         _OP_LOCK.release()
 
@@ -638,10 +824,15 @@ def _parse_log_line(raw):
         payload = {"report": str(payload)}
 
     platform = payload.get("platform")
-    if platform not in ("workbuddy", "trae"):
+    if platform not in ("workbuddy", "trae", "qoder"):
         # WorkBuddy 侧的日志不带 platform 字段，只能靠 step 前缀区分
-        platform = "trae" if str(payload.get("step") or "").startswith("trae") \
-            else "workbuddy"
+        step = str(payload.get("step") or "")
+        if step.startswith("trae"):
+            platform = "trae"
+        elif step.startswith("qoder"):
+            platform = "qoder"
+        else:
+            platform = "workbuddy"
 
     result = payload.get("result") or "INFO"
     return {
@@ -666,7 +857,7 @@ def _parse_log_line(raw):
 
 
 def _log_facets(entries):
-    by_platform = {"workbuddy": 0, "trae": 0}
+    by_platform = {"workbuddy": 0, "trae": 0, "qoder": 0}
     by_result = {}
     for e in entries:
         by_platform[e["platform"]] = by_platform.get(e["platform"], 0) + 1
@@ -692,7 +883,7 @@ def api_logs():
     by_platform, by_result = _log_facets(entries)
 
     def keep(e):
-        if platform in ("workbuddy", "trae") and e["platform"] != platform:
+        if platform in ("workbuddy", "trae", "qoder") and e["platform"] != platform:
             return False
         if result != "all" and e["result"] != result:
             return False
@@ -750,7 +941,7 @@ _PS_END = "<<<WBJSONEND>>>"
 # 任务名，所以这里按名字循环，而不是一次 -TaskName @(...) 批量查。
 _PS_LIST = r"""
 $ErrorActionPreference = 'SilentlyContinue'
-$names = @('WorkBuddyAutoSignin','WorkBuddyGrowthPoll','TraeAutoSignin')
+$names = @('WorkBuddyAutoSignin','WorkBuddyGrowthPoll','TraeAutoSignin','QoderAutoSignin')
 $out = @()
 foreach ($n in $names) {
   $t = Get-ScheduledTask -TaskName $n
@@ -1130,8 +1321,10 @@ def _on_auto_signin_run():
                 continue
             if prov["engine"] == "wb":
                 results.append(sign_workbuddy(pid, prov["name"]))
-            else:
+            elif prov["engine"] == "trae":
                 results.append(sign_trae(pid, prov["name"]))
+            else:
+                results.append(sign_qoder(pid, prov["name"]))
         return results
     finally:
         _OP_LOCK.release()
@@ -1140,18 +1333,12 @@ def _on_auto_signin_run():
 def plat_has_credential(pid):
     """某个平台是否已有可用凭据（对同引擎平台复用同一凭据存在性判定）。"""
     engine = PROVIDER_MAP[pid]["engine"]
-    if engine == "wb":
-        try:
-            _load_wb()
-            return True
-        except AuthMissing:
-            return False
-    else:
-        try:
-            _load_trae()
-            return True
-        except AuthMissing:
-            return False
+    loader = {"wb": _load_wb, "trae": _load_trae, "qoder": _load_qoder}[engine]
+    try:
+        loader()
+        return True
+    except AuthMissing:
+        return False
 
 
 def _auto_scheduler():
